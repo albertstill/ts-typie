@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import * as fs from 'fs';
 import * as path from 'path';
-import { exec } from 'child_process';
-import * as request from 'request';
-import * as chalk from 'chalk';
+import { execSync } from 'child_process';
+import fetch from 'node-fetch';
+import chalk from 'chalk';
 import * as figures from 'figures';
 import * as args from 'args';
 import * as commandExists from 'command-exists';
@@ -37,8 +37,7 @@ const opts = args.parse(process.argv, {
     subColor: 'dim'
 });
 const tool = tools[opts.tool];
-
-
+console.log(chalk.blue(`Using ${opts.tool}`));
 
 // check if package.json exists
 
@@ -53,58 +52,69 @@ if (!fs.existsSync(packagePath)) {
 // Package.json exists
 
 const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
-let dependencies: string[] = [];
 
-if (pkg.dependencies) {
-    dependencies.push(...Object.keys(pkg.dependencies));
-}
-if (pkg.devDependencies) {
-    dependencies.push(...Object.keys(pkg.devDependencies));
+const depsObject = {
+    ...pkg.dependencies,
+    ...pkg.devDependencies,
 }
 
 // Filter out already installed types
+const alreadyInstalledTypes: string[] = Object.keys(depsObject).filter(d => /^@types\//.test(d));;
+const dependencies: string[] = Object.keys(depsObject).filter(d => !/^@types\//.test(d));
 
-let alreadyInstalledTypes = dependencies.filter(d => /^@types\//.test(d));;
-dependencies = dependencies.filter(d => !/^@types\//.test(d));
+console.log(chalk.blue(`Will check ${dependencies.length} deps from devDependencies and dependencies`));
 
-for (let dependency of dependencies) {
-    const dependencyString = chalk.bold(dependency)
+(async () => {
+    const findTypesToInstall: Array<Promise<null | string>> = dependencies.map(async (dependency) => {
+        const dependencyString = chalk.bold(dependency)
 
-    // Check if types are already installed
+        // Check if types are already installed
 
-    if (alreadyInstalledTypes.includes('@types/' + dependency)) {
-        console.log(chalk.yellow(figures.play, `Types for ${dependencyString} already installed. Skipping...`));
-        continue;
-    }
-
-    // Check for included types
-    let pkgPath = path.join(cwd, 'node_modules', dependency, 'package.json');
-
-
-    if (fs.existsSync(pkgPath)) {
-        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-        if (pkg.types || pkg.typings) {
-            console.log(chalk.yellow(figures.warning, `Module ${dependencyString} includes own types. Skipping...`));
-            continue;
+        if (alreadyInstalledTypes.includes('@types/' + dependency)) {
+            console.log(chalk.yellow(figures.play, `Types for ${dependencyString} already installed. Skipping...`));
+            return null;
         }
-    }
 
-    // Check if types are available    
+        // Check for included types
+        let pkgPath = path.join(cwd, 'node_modules', dependency, 'package.json');
 
-    ((dependency) => {
-        request('https://www.npmjs.com/package/@types/' + dependency, (err, res, body) => {
 
-            if (res.statusCode == 200) {
-                exec(`${tool.command} @types/${dependency}`, (err, stdout, stderr) => {
-                    if (!err) {
-                        console.log(chalk.green(figures.tick, `@types/${dependencyString} installed successfully!`));
-                    }
-                });
-            } else {
-                console.log(chalk.red(figures.cross, `No types found for ${dependencyString} in registry. Skipping...`));
+        if (fs.existsSync(pkgPath)) {
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            if (pkg.types || pkg.typings) {
+                console.log(chalk.yellow(figures.warning, `Module ${dependencyString} includes own types. Skipping...`));
+                return null;
             }
+        }
 
-        });
-    })(dependency);
+        const typePackage = '@types/' + dependency
 
-}
+        // Check if types are available on registry API
+        const response = await fetch('https://registry.npmjs.org/' + typePackage)
+
+        if (response.status == 200) {
+            console.log(chalk.green(figures.tick, `Type found for ${typePackage} in registry.`));
+            return dependency;
+        } else {
+            console.log(chalk.red(figures.cross, `No types found for ${dependencyString} in registry. Skipping...`));
+            return null;
+        }
+    })
+
+    console.log(chalk.blue('Communicating with npm to check for types...'));
+
+    const typesToInstall = (await Promise.all(findTypesToInstall)).filter((maybeString): maybeString is string => !!maybeString)
+
+    console.log(chalk.green(figures.tick, `Found ${typesToInstall.length} @type packages to install...`));
+
+    // yarn add cli asks you what version you want if it doesn't have the equivalent semver version, npm errors
+    // for example if you had package@^2.0 but @types/package@^2.0 did not exist, yarn would ask what you wanted.
+    // only adding version for yarn
+    const hasInteractiveInstallerForVersionMismatch = opts.tool === 'yarn';
+
+    const installCmd =
+        `${tool.command} ${typesToInstall.map(dependency => `@types/${dependency}${hasInteractiveInstallerForVersionMismatch ? `@${depsObject[dependency]}` : ''}`).join(' ')}`
+
+    console.log(installCmd)
+    execSync(installCmd, { stdio: 'inherit' });
+})()    
